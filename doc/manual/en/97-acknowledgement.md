@@ -39,6 +39,8 @@ Shashidhar B M <shashidhar.i.0119@gmail.com>
 Trevor Jacob Mathews <trevorjacobmathews@gmail.com>
 Abdelrhman Sersawy <abdelrhmansersawy@gmail.com>
 Zeyad Daowd <zeyaddaowd@yahoo.com>
+Bhawesh Panwar <panwarbhawesh1112@gmail.com>
+
 ```
 
 ## Committers

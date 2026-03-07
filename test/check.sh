@@ -570,6 +570,7 @@ usage() {
   echo "  setup                  Install dependencies and build PostgreSQL image (one-time setup)"
   echo "  clean                  Clean up test suite environment and remove PostgreSQL image"
   echo "  run-configs            Run the testsuite on multiple pgagroal configurations (containerized)"
+  echo "  failover-tests         Run failover notify script tests" 
   echo "  ci                     Run in CI mode (local PostgreSQL, no container)"
   echo "  run-configs-ci         Run multiple configuration tests using local PostgreSQL (like ci + run-configs)"
   echo "  ci-nonbuild            Run in CI mode (local PostgreSQL, skip build step)"
@@ -587,6 +588,357 @@ usage() {
   echo "  $0 -t connection        Run test matching 'connection'"
   echo "  $0 -m connection        Run all tests in module 'connection'"
   exit 1
+}
+
+set -e
+
+TEST_BASE="/tmp/pgagroal-failover-test"
+LOG_DIR="$TEST_BASE/log"
+CONFIGURATION_DIRECTORY="$TEST_BASE/conf"
+PG_LOG_DIR="$TEST_BASE/pglog"
+
+PG_DATABASE="mydb"
+PG_USER_NAME="myuser"
+PG_USER_PASSWORD="yourpassword"
+
+PG_REPL_USER_NAME="repl"
+PG_REPL_PASSWORD="replpass"
+
+PG_UTF8_USER_NAME="utf8user"
+PG_UTF8_USER_PASSWORD="yourpassword"
+PG_UTF8_DATABASE="utf8db"
+
+PRIMARY_PORT=7432
+STANDBY1_PORT=7433
+STANDBY2_PORT=7434
+
+PGAGROAL_PORT=${PGAGROAL_PORT:-6432}
+
+failover_container_name() {
+  echo "pgagroal-test-postgresql${ENV_PGVERSION}-$1"
+}
+
+failover_prepare_dirs() {
+
+  mkdir -p "$LOG_DIR"
+  mkdir -p "$CONFIGURATION_DIRECTORY"
+  mkdir -p "$PG_LOG_DIR"/{primary,standby1,standby2}
+
+  BASE="$PG_LOG_DIR"
+
+  POSTGRES_UID=$($CONTAINER_ENGINE run --rm $IMAGE_NAME id -u postgres)
+
+  if [ -d "$BASE" ]; then
+    $CONTAINER_ENGINE unshare chown -R ${POSTGRES_UID}:${POSTGRES_UID} ${BASE} 2>/dev/null || \
+    echo "Warning: Could not change ownership of $BASE"
+  fi
+}
+
+failover_start_container() {
+
+  local name=$1
+  local host_port=$2
+  local container_port=$3
+
+  local cname
+  cname=$(failover_container_name "$name")
+
+  $CONTAINER_ENGINE rm -f "$cname" >/dev/null 2>&1 || true
+
+  $CONTAINER_ENGINE run -d \
+    --name "$cname" \
+    -p ${host_port}:${container_port} \
+    -v "$PG_LOG_DIR/$name:/pglog:Z" \
+    -e PG_DATABASE=$PG_DATABASE \
+    -e PG_USER_NAME=$PG_USER_NAME \
+    -e PG_USER_PASSWORD=$PG_USER_PASSWORD \
+    -e PG_REPL_USER_NAME=$PG_REPL_USER_NAME \
+    -e PG_REPL_PASSWORD=$PG_REPL_PASSWORD \
+    -e PG_UTF8_USER_NAME=$PG_UTF8_USER_NAME \
+    -e PG_UTF8_USER_PASSWORD=$PG_UTF8_USER_PASSWORD \
+    -e PG_UTF8_DATABASE=$PG_UTF8_DATABASE \
+    -e PG_LOG_LEVEL=debug5 \
+    $IMAGE_NAME
+}
+
+failover_wait_ready() {
+
+  local cname=$1
+
+  for attempt in {1..20}; do
+    if $CONTAINER_ENGINE exec "$cname" \
+      /usr/pgsql-${ENV_PGVERSION}/bin/pg_isready -h localhost -p 5432 \
+      >/dev/null 2>&1
+    then
+      echo "$cname ready"
+      return
+    fi
+    sleep 2
+  done
+
+  echo "$cname failed to start"
+  $CONTAINER_ENGINE logs "$cname"
+  exit 1
+}
+
+failover_start_postgresql_cluster() {
+
+  echo ""
+  echo "Starting PostgreSQL cluster..."
+
+  failover_prepare_dirs
+
+  failover_start_container primary $PRIMARY_PORT 5432
+  failover_start_container standby1 $STANDBY1_PORT 5433
+  failover_start_container standby2 $STANDBY2_PORT 5434
+
+  failover_wait_ready "$(failover_container_name primary)"
+  failover_wait_ready "$(failover_container_name standby1)"
+  failover_wait_ready "$(failover_container_name standby2)"
+}
+
+failover_stop_postgresql_cluster() {
+
+  echo "Stopping PostgreSQL cluster"
+
+  for name in primary standby1 standby2
+  do
+    $CONTAINER_ENGINE rm -f "$(failover_container_name $name)" \
+      >/dev/null 2>&1 || true
+  done
+}
+
+failover_create_script() {
+
+  local script_path=$1
+  local exit_code=$2
+  local log_file=$3
+
+  cat > "$script_path" <<EOF
+#!/bin/bash
+echo "\$(date): Script called with \$# arguments" >> $log_file
+echo "\$(date): Args: \$@" >> $log_file
+exit $exit_code
+EOF
+
+  chmod +x "$script_path"
+}
+
+failover_create_config() {
+
+  local notify_script=$1
+  local failover_script="/tmp/failover.sh"
+
+  failover_create_script "$failover_script" 0 "/tmp/failover_test.log"
+
+  cat > "$CONFIGURATION_DIRECTORY/pgagroal.conf" <<EOF
+[pgagroal]
+host = *
+port = $PGAGROAL_PORT
+
+log_type = file
+log_level = debug
+log_path = $LOG_DIR/pgagroal.log
+
+failover = on
+failover_script = $failover_script
+failover_notify_script = $notify_script
+
+unix_socket_dir = /tmp/
+
+[primary]
+host = localhost
+port = 7432
+
+[standby1]
+host = localhost
+port = 7433
+
+[standby2]
+host = localhost
+port = 7434
+EOF
+
+  cat > "$CONFIGURATION_DIRECTORY/pgagroal_hba.conf" <<EOF
+host all all all all
+EOF
+}
+
+failover_stop_pgagroal() {
+
+  pkill -f pgagroal >/dev/null 2>&1 || true
+  sleep 2
+  pkill -9 -f pgagroal >/dev/null 2>&1 || true
+  rm -f /tmp/pgagroal.*.pid
+}
+
+test_failover_notify_success() {
+
+  echo ""
+  echo "=========================================="
+  echo "Test 1: Failover Notify Success"
+  echo "=========================================="
+
+  local notify_script="/tmp/test_notify_success.sh"
+  local log_file="/tmp/failover_notify_test.log"
+
+  rm -f "$notify_script" "$log_file"
+
+  failover_create_script "$notify_script" 0 "$log_file"
+
+  failover_start_postgresql_cluster
+
+  failover_create_config "$notify_script"
+
+  echo "Starting pgagroal..."
+
+  $EXECUTABLE_DIRECTORY/pgagroal \
+    -c "$CONFIGURATION_DIRECTORY/pgagroal.conf" \
+    -a "$CONFIGURATION_DIRECTORY/pgagroal_hba.conf" \
+    -d
+
+  sleep 5
+
+  echo "Testing connection"
+
+  PGPASSWORD=$PG_USER_PASSWORD \
+  timeout 5 psql -h localhost -p $PGAGROAL_PORT \
+  -U $PG_USER_NAME -d $PG_DATABASE \
+  -c "SELECT 1" >/dev/null 2>&1 || true
+
+  echo ""
+  echo "Simulating primary failure"
+
+  $CONTAINER_ENGINE stop "$(failover_container_name primary)"
+
+  PGPASSWORD=$PG_USER_PASSWORD \
+  timeout 5 psql -h localhost -p $PGAGROAL_PORT \
+  -U $PG_USER_NAME -d $PG_DATABASE \
+  -c "CREATE TABLE failover_test(id int);" \
+  >/dev/null 2>&1 || true
+
+  sleep 15
+
+  if [ -f "$log_file" ]; then
+    echo "Notify script executed"
+    cat "$log_file"
+  else
+    echo "Notify script not executed"
+    tail -20 "$LOG_DIR/pgagroal.log"
+  fi
+
+  failover_stop_pgagroal
+  failover_stop_postgresql_cluster
+}
+
+test_failover_notify_failure() {
+
+  echo ""
+  echo "=========================================="
+  echo "Test 2: Failover Notify Failure"
+  echo "=========================================="
+
+  local notify_script="/tmp/test_notify_fail.sh"
+  local log_file="/tmp/failover_notify_test.log"
+
+  rm -f "$notify_script" "$log_file"
+
+  failover_create_script "$notify_script" 1 "$log_file"
+
+  failover_start_postgresql_cluster
+
+  failover_create_config "$notify_script"
+
+  $EXECUTABLE_DIRECTORY/pgagroal \
+    -c "$CONFIGURATION_DIRECTORY/pgagroal.conf" \
+    -a "$CONFIGURATION_DIRECTORY/pgagroal_hba.conf" \
+    -d
+
+  sleep 5
+
+  $CONTAINER_ENGINE stop "$(failover_container_name primary)"
+
+  PGPASSWORD=$PG_USER_PASSWORD \
+  timeout 5 psql -h localhost -p $PGAGROAL_PORT \
+  -U $PG_USER_NAME -d $PG_DATABASE \
+  -c "CREATE TABLE failover_test(id int);" \
+  >/dev/null 2>&1 || true
+
+  sleep 15
+
+  if [ -f "$log_file" ]; then
+    echo "Notify script executed"
+    cat "$log_file"
+  fi
+
+  if grep -q "Error from notify script" "$LOG_DIR/pgagroal.log"; then
+    echo "Error correctly logged"
+  fi
+
+  failover_stop_pgagroal
+  failover_stop_postgresql_cluster
+}
+
+failover_cleanup() {
+
+  echo ""
+  echo "=========================================="
+  echo "Cleaning up"
+  echo "=========================================="
+
+  for name in primary standby1 standby2
+  do
+    $CONTAINER_ENGINE rm -f "$(failover_container_name $name)" \
+      >/dev/null 2>&1 || true
+  done
+
+  pkill -9 -f pgagroal >/dev/null 2>&1 || true
+
+  if [ -d "$TEST_BASE" ]; then
+    echo "Fixing permissions before cleanup..."
+    sudo chown -R $(id -u):$(id -g) "$TEST_BASE" 2>/dev/null || \
+    $CONTAINER_ENGINE unshare chown -R $(id -u):$(id -g) "$TEST_BASE" 2>/dev/null || true
+  fi
+
+  rm -f /tmp/test_notify_*.sh
+  rm -f /tmp/failover*.sh
+  rm -f /tmp/failover_notify_test.log
+  rm -f /tmp/failover_test.log
+
+  if [ "$CONTAINER_ENGINE" = "podman" ]; then
+    echo "Removing podman pods..."
+    podman pod rm -f $(podman pod ls -q) 2>/dev/null || true
+    podman rm -f $(podman ps -aq) 2>/dev/null || true
+  fi
+
+  rm -rf "$TEST_BASE" 2>/dev/null || {
+    echo "Warning: Could not remove $TEST_BASE, trying with sudo..."
+    sudo rm -rf "$TEST_BASE" 2>/dev/null || true
+  }
+}
+
+run_failover_tests() {
+
+  echo ""
+  echo "=========================================="
+  echo "Running Failover Notification Tests"
+  echo "=========================================="
+
+  failover_prepare_dirs
+
+  if ! $CONTAINER_ENGINE image inspect "$IMAGE_NAME" >/dev/null 2>&1
+  then
+    log "Building PostgreSQL image"
+    build_postgresql_image
+  fi
+
+  test_failover_notify_success
+  test_failover_notify_failure
+
+  failover_cleanup
+
+  echo ""
+  echo "Failover tests completed"
 }
 
 do_setup() {
@@ -739,6 +1091,10 @@ while [[ $# -gt 0 ]]; do
          [[ -n "$SUBCOMMAND" ]] && usage
          SUBCOMMAND="run-configs"
          shift
+         ;;
+      failover-tests)
+         run_failover_tests
+         exit 0
          ;;
       ci)
          [[ -n "$SUBCOMMAND" ]] && usage

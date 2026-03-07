@@ -455,7 +455,7 @@ notify_standbys(int old_primary, int new_primary)
 
       if (!has_standbys)
       {
-         pgagroal_log_info("Notify: No standbys to notify");
+         pgagroal_log_warn("Notify: No standbys to notify");
          exit(0);
       }
 

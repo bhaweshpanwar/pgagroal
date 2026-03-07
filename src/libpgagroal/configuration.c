@@ -578,6 +578,12 @@ pgagroal_validate_configuration(void* shm, bool has_unix_socket, bool has_main_s
          return 1;
       }
 
+      if (strcmp(config->failover_script, config->failover_notify_script) == 0)
+      {
+         pgagroal_log_fatal("pgagroal: failover_notify_script cannot be the same as failover_script");
+         return 1;
+      }
+
       memset(&st, 0, sizeof(struct stat));
 
       if (stat(config->failover_notify_script, &st) == -1)
